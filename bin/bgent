@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""bgent — a communication bus for background Claude Code sessions.
+
+Sessions message each other (durable inbox) and gain awareness of what the others are
+doing. Discovery is native: bgent asks `claude agents --json` who exists, so there is no
+registration step that can drift. Plan-only: never calls `claude -p`, no API billing.
+The store is file-based under ~/.bgent.
+"""
+import sys, os, json, time, re, shutil, subprocess, argparse
+try:
+    import fcntl
+    HAVE_FCNTL = True
+except Exception:
+    HAVE_FCNTL = False
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+def strip_ansi(s): return ANSI_RE.sub("", s)
+
+def _which_claude():
+    return shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+
+HOME = os.environ.get("BGENT_HOME", os.path.expanduser("~/.bgent"))
+INBOX = os.path.join(HOME, "inbox")
+ACTIVITY = os.path.join(HOME, "activity.jsonl")
+CLAUDE_BIN = os.environ.get("BGENT_CLAUDE_BIN") or _which_claude()
+RETAIN_READ_SECS = 7 * 24 * 3600  # prune messages already read more than 7 days ago
+
+def now(): return time.time()
+def ensure(): os.makedirs(INBOX, exist_ok=True)
+
+def append_locked(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        if HAVE_FCNTL: fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        if HAVE_FCNTL: fcntl.flock(f, fcntl.LOCK_UN)
+
+def live_agents():
+    """All live Claude Code sessions, keyed by full session id, straight from the daemon."""
+    try:
+        o = subprocess.run([CLAUDE_BIN, "agents", "--json"], capture_output=True, text=True, timeout=15).stdout
+        return {s["sessionId"]: s for s in json.loads(o) if s.get("sessionId")}
+    except Exception:
+        return {}
+
+def load_sessions():
+    """Canonical session source = `claude agents --json` (the Claude Code daemon already
+    tracks every live session). No hook-based registration that can drift. Returns the
+    {id: rec} contract the rest of the CLI relies on."""
+    out = {}
+    for sid, s in live_agents().items():
+        out[sid] = {"id": sid, "name": s.get("name") or sid[:8], "cwd": s.get("cwd", ""),
+                    "status": s.get("status") or s.get("state") or "unknown",
+                    "started": s.get("startedAt")}
+    return out
+
+def resolve(target, sessions):
+    """Resolve a target by full id, short id prefix, exact name, then name substring."""
+    for sid, r in sessions.items():
+        if sid == target or sid.startswith(target): return r
+    for sid, r in sessions.items():
+        if r.get("name") == target: return r
+    for sid, r in sessions.items():
+        if target.lower() in str(r.get("name", "")).lower(): return r
+    return None
+
+def c_spawn(a):
+    """Create a background session (`claude --bg`, plan mode) and return its id. It shows
+    up in `claude agents --json` on its own, so there is nothing to register."""
+    ensure()
+    cwd = a.cwd or os.getcwd()
+    try:
+        p = subprocess.run([CLAUDE_BIN, "--bg", "-n", a.name, a.prompt],
+                           capture_output=True, text=True, timeout=40, cwd=cwd)
+    except Exception as e:
+        print(f"ERR spawn: {e}", file=sys.stderr); sys.exit(3)
+    out = strip_ansi(p.stdout + "\n" + p.stderr)
+    m = re.search(r"backgrounded\s*[^\w]*\s*(\w{6,})", out)
+    if not m:
+        print("ERR spawn: no id in output: " + out.strip()[:200], file=sys.stderr); sys.exit(3)
+    short = m.group(1)
+    time.sleep(2)
+    sid = next((k for k in live_agents() if k.startswith(short)), short)  # full uuid if found
+    print(json.dumps({"id": sid, "name": a.name}, ensure_ascii=False))
+
+def c_ls(a):
+    sessions = load_sessions()
+    rows = [{"name": r.get("name"), "id": sid[:8], "status": r.get("status"), "cwd": r.get("cwd", "")}
+            for sid, r in sessions.items()]
+    if a.json: print(json.dumps(rows, ensure_ascii=False)); return
+    if not rows: print("(no sessions)"); return
+    for r in rows: print(f"{str(r['name']):24.24} {r['id']} {str(r['status']):8} {r['cwd']}")
+
+def c_send(a):
+    ensure(); sessions = load_sessions(); t = resolve(a.to, sessions)
+    if not t: print(f"ERR unknown target: {a.to}", file=sys.stderr); sys.exit(2)
+    frm = resolve(a.from_, sessions); from_name = frm["name"] if frm else a.from_
+    mid = f"{int(now()*1000)}-{os.getpid()}"
+    append_locked(os.path.join(INBOX, t["id"] + ".jsonl"),
+                  {"id": mid, "from": from_name, "to": t["id"], "ts": now(), "body": a.body, "read": False})
+    print(f"-> {t['name']} (inbox)")
+
+def c_broadcast(a):
+    ensure(); sessions = load_sessions()
+    frm = resolve(a.from_, sessions); from_name = frm["name"] if frm else a.from_
+    n = 0
+    for sid, r in sessions.items():
+        if frm and sid == frm["id"]: continue
+        mid = f"{int(now()*1000)}-{os.getpid()}-{n}"
+        append_locked(os.path.join(INBOX, sid + ".jsonl"),
+                      {"id": mid, "from": from_name, "to": sid, "ts": now(), "body": a.body, "read": False})
+        n += 1
+    print(f"broadcast -> {n}")
+
+def c_inbox(a):
+    sessions = load_sessions(); t = resolve(a.id, sessions)
+    sid = t["id"] if t else a.id
+    path = os.path.join(INBOX, sid + ".jsonl"); msgs = []
+    if os.path.exists(path):
+        for ln in open(path):
+            try: msgs.append(json.loads(ln))
+            except Exception: pass
+    shown = [m for m in msgs if not m.get("read")] if a.unread else msgs
+    for m in shown: print(f"[{m['from']}] {m['body']}")
+    if not shown: print("(inbox empty)")
+    if a.mark_read and msgs:
+        for m in msgs: m["read"] = True
+        with open(path, "w") as f:
+            for m in msgs: f.write(json.dumps(m, ensure_ascii=False) + "\n")
+
+def c_activity(a):
+    sessions = load_sessions(); t = resolve(a.id, sessions)
+    nm = a.name or (t.get("name") if t else a.id[:8])
+    append_locked(ACTIVITY, {"ts": now(), "id": (t["id"] if t else a.id), "name": nm, "summary": a.summary})
+    print("ok")
+
+def _awareness_lines(sid, sessions):
+    acts = {}
+    if os.path.exists(ACTIVITY):
+        for ln in open(ACTIVITY):
+            try:
+                r = json.loads(ln)
+                if r["id"] != sid: acts[r["id"]] = r
+            except Exception: pass
+    lines = []
+    for s2, r2 in sessions.items():
+        if s2 == sid: continue
+        st = r2.get("status", "unknown")
+        last = acts.get(s2, {}).get("summary", "")
+        lines.append(f"  - {r2.get('name')} [{st}]" + (f": {last}" if last else ""))
+    return lines
+
+def c_awareness(a):
+    sessions = load_sessions()
+    t = resolve(a.id, sessions); sid = t["id"] if t else a.id
+    lines = _awareness_lines(sid, sessions)
+    print("\n".join(lines) if lines else "(no other sessions)")
+
+def _deliver_ctx(sid):
+    """Build the context to inject (unread inbox + awareness). Returns (ctx, allm, path, unread)."""
+    sessions = load_sessions()
+    t = resolve(sid, sessions); rid = t["id"] if t else sid
+    path = os.path.join(INBOX, rid + ".jsonl"); allm = []; unread = []
+    if os.path.exists(path):
+        for ln in open(path):
+            try:
+                m = json.loads(ln); allm.append(m)
+                if not m.get("read"): unread.append(m)
+            except Exception: pass
+    parts = []
+    if unread:
+        parts.append("Messages from other sessions (bgent):")
+        for m in unread: parts.append(f"  - {m['from']}: {m['body']}")
+    aw = _awareness_lines(rid, sessions)
+    if aw:
+        parts.append("What the other sessions are doing now (bgent awareness):"); parts.extend(aw)
+    return "\n".join(parts), allm, path, unread
+
+def _mark_read(allm, unread, path):
+    """Mark ONLY the delivered messages (by id) as read, under a lock and RE-READING the
+    file: if a new message arrived between the read and now, it is not overwritten (this
+    fixes the race of the old lockless rewrite). Also prunes messages read long ago."""
+    if not unread or not os.path.exists(path): return
+    read_ids = {m.get("id") for m in unread}
+    cutoff = now() - RETAIN_READ_SECS
+    with open(path, "r+") as f:
+        if HAVE_FCNTL: fcntl.flock(f, fcntl.LOCK_EX)
+        kept = []
+        for ln in f.readlines():
+            try: m = json.loads(ln)
+            except Exception: continue
+            if m.get("id") in read_ids: m["read"] = True
+            if m.get("read") and m.get("ts", cutoff + 1) < cutoff: continue  # prune read + old
+            kept.append(m)
+        f.seek(0); f.truncate()
+        for m in kept: f.write(json.dumps(m, ensure_ascii=False) + "\n")
+        if HAVE_FCNTL: fcntl.flock(f, fcntl.LOCK_UN)
+
+def last_assistant_text(tpath):
+    """Last assistant text turn in a transcript jsonl (used for automatic activity)."""
+    if not tpath or not os.path.exists(tpath): return ""
+    last = ""
+    try:
+        for line in open(tpath):
+            try: o = json.loads(line)
+            except Exception: continue
+            m = o.get("message", {})
+            if isinstance(m, dict) and m.get("role") == "assistant":
+                c = m.get("content", "")
+                if isinstance(c, list):
+                    c = " ".join(x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text")
+                if isinstance(c, str) and c.strip(): last = c.strip()
+    except Exception: pass
+    return last.replace("\n", " ")[:200]
+
+def read_hook_input():
+    try:
+        raw = sys.stdin.read()
+        return json.loads(raw) if raw.strip() else {}
+    except Exception:
+        return {}
+
+def c_hook(a):
+    """Dispatcher for the Claude Code hooks. Reads the flat payload from stdin.
+    Events: session-start | user-prompt | stop."""
+    data = read_hook_input()
+    sid = data.get("session_id") or data.get("sessionId") or ""
+    tpath = data.get("transcript_path") or ""
+    if not sid: return
+    ensure()
+    ev = a.event
+    if ev == "session-start":
+        # pull accumulated messages + awareness when the session opens or resumes
+        ctx, allm, path, unread = _deliver_ctx(sid)
+        _mark_read(allm, unread, path)
+        if ctx:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
+    elif ev == "user-prompt":
+        ctx, allm, path, unread = _deliver_ctx(sid)
+        _mark_read(allm, unread, path)
+        if ctx:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ctx}}))
+    elif ev == "stop":
+        summary = last_assistant_text(tpath)
+        if summary:
+            t = resolve(sid, load_sessions())
+            nm = t.get("name") if t else sid[:8]
+            append_locked(ACTIVITY, {"ts": now(), "id": (t["id"] if t else sid), "name": nm, "summary": summary})
+        # deliver messages on turn end; ONLY continue the turn if there is an unread message.
+        # awareness alone never holds the turn (otherwise the session would never stop = loop).
+        ctx, allm, path, unread = _deliver_ctx(sid)
+        if unread:
+            _mark_read(allm, unread, path)
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "Stop", "additionalContext": ctx}}))
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="bgent", description="communication bus for background Claude Code sessions")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sp = sub.add_parser("spawn"); sp.add_argument("--name", required=True); sp.add_argument("--prompt", required=True); sp.add_argument("--cwd"); sp.set_defaults(fn=c_spawn)
+    l = sub.add_parser("ls"); l.add_argument("--json", action="store_true"); l.set_defaults(fn=c_ls)
+    s = sub.add_parser("send"); s.add_argument("to"); s.add_argument("body"); s.add_argument("--from", dest="from_", default="unknown"); s.set_defaults(fn=c_send)
+    b = sub.add_parser("broadcast"); b.add_argument("body"); b.add_argument("--from", dest="from_", default="unknown"); b.set_defaults(fn=c_broadcast)
+    i = sub.add_parser("inbox"); i.add_argument("id"); i.add_argument("--unread", action="store_true"); i.add_argument("--mark-read", action="store_true"); i.set_defaults(fn=c_inbox)
+    ac = sub.add_parser("activity"); ac.add_argument("id"); ac.add_argument("summary"); ac.add_argument("--name"); ac.set_defaults(fn=c_activity)
+    aw = sub.add_parser("awareness"); aw.add_argument("id"); aw.set_defaults(fn=c_awareness)
+    hk = sub.add_parser("hook"); hk.add_argument("event", choices=["session-start", "user-prompt", "stop"]); hk.set_defaults(fn=c_hook)
+    return p
+
+if __name__ == "__main__":
+    args = build_parser().parse_args()
+    args.fn(args)

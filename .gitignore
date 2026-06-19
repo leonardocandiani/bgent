@@ -1,0 +1,5 @@
+# bgent runtime store (created at ~/.bgent by default; ignore any local copy)
+.bgent/
+*.pyc
+__pycache__/
+.DS_Store

@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""bgent-mcp — MCP server (stdio, JSON-RPC 2.0) exposing bgent as native Claude Code tools.
+Zero dependencies: pure stdlib. Reuses the `bgent` CLI via subprocess.
+
+Passive reception (awareness + inbox before each prompt) is handled by the hooks; this
+server covers active use: list, send, broadcast, spawn, publish activity, read inbox.
+
+Identity ("from"/self) is the Claude Code session id (CLAUDE_CODE_SESSION_ID), overridable
+via the BGENT_SELF env var.
+"""
+import sys, os, json, subprocess
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BGENT = os.path.join(HERE, "bgent")
+PROTOCOL_FALLBACK = "2025-06-18"
+
+def self_name():
+    return (os.environ.get("BGENT_SELF") or os.environ.get("CLAUDE_CODE_SESSION_ID")
+            or os.path.basename(os.getcwd().rstrip("/")) or "mcp")
+
+def sh(args):
+    try:
+        r = subprocess.run([sys.executable, BGENT] + args, capture_output=True, text=True, timeout=60)
+        return (r.stdout or r.stderr or "").strip()
+    except Exception as e:
+        return f"ERR {e}"
+
+TOOLS = [
+    {"name": "bgent_ls",
+     "description": "List all live Claude Code sessions on the bus and their status.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "bgent_send",
+     "description": "Send a message to another session. It lands in the target's inbox and is delivered on its next turn. 'to' accepts a name or an id (prefix).",
+     "inputSchema": {"type": "object",
+                     "properties": {"to": {"type": "string", "description": "name or id of the target session"},
+                                    "message": {"type": "string"}},
+                     "required": ["to", "message"]}},
+    {"name": "bgent_broadcast",
+     "description": "Send a message to every other session on the bus.",
+     "inputSchema": {"type": "object",
+                     "properties": {"message": {"type": "string"}},
+                     "required": ["message"]}},
+    {"name": "bgent_awareness",
+     "description": "Show what the other sessions are doing right now.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "bgent_inbox",
+     "description": "Read the messages this session has received.",
+     "inputSchema": {"type": "object",
+                     "properties": {"unread_only": {"type": "boolean"}}}},
+    {"name": "bgent_activity",
+     "description": "Publish what this session is doing, so the others gain awareness.",
+     "inputSchema": {"type": "object",
+                     "properties": {"summary": {"type": "string"}},
+                     "required": ["summary"]}},
+    {"name": "bgent_spawn",
+     "description": "Create a new background session (plan mode, no API cost), addressable on the bus right away.",
+     "inputSchema": {"type": "object",
+                     "properties": {"name": {"type": "string"},
+                                    "prompt": {"type": "string"},
+                                    "cwd": {"type": "string"}},
+                     "required": ["name", "prompt"]}},
+]
+
+def call_tool(name, args):
+    me = self_name()
+    if name == "bgent_ls":
+        return sh(["ls"])
+    if name == "bgent_send":
+        return sh(["send", str(args["to"]), str(args["message"]), "--from", me])
+    if name == "bgent_broadcast":
+        return sh(["broadcast", str(args["message"]), "--from", me])
+    if name == "bgent_awareness":
+        return sh(["awareness", me])
+    if name == "bgent_inbox":
+        a = ["inbox", me]
+        if args.get("unread_only"): a.append("--unread")
+        return sh(a)
+    if name == "bgent_activity":
+        return sh(["activity", me, str(args["summary"]), "--name", me])
+    if name == "bgent_spawn":
+        a = ["spawn", "--name", str(args["name"]), "--prompt", str(args["prompt"])]
+        if args.get("cwd"): a += ["--cwd", str(args["cwd"])]
+        return sh(a)
+    return f"ERR unknown tool: {name}"
+
+def write_msg(obj):
+    sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
+
+def result(mid, res): write_msg({"jsonrpc": "2.0", "id": mid, "result": res})
+def error(mid, code, msg): write_msg({"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": msg}})
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line: continue
+        try: req = json.loads(line)
+        except Exception: continue
+        mid = req.get("id"); method = req.get("method")
+        if method == "initialize":
+            pv = (req.get("params") or {}).get("protocolVersion", PROTOCOL_FALLBACK)
+            result(mid, {"protocolVersion": pv,
+                         "capabilities": {"tools": {}},
+                         "serverInfo": {"name": "bgent", "version": "1.0.0"}})
+        elif method in ("notifications/initialized", "initialized"):
+            continue  # notification, no response
+        elif method == "ping":
+            result(mid, {})
+        elif method == "tools/list":
+            result(mid, {"tools": TOOLS})
+        elif method == "tools/call":
+            params = req.get("params") or {}
+            name = params.get("name"); args = params.get("arguments") or {}
+            try:
+                out = call_tool(name, args)
+                result(mid, {"content": [{"type": "text", "text": out or "(ok)"}]})
+            except Exception as e:
+                result(mid, {"content": [{"type": "text", "text": f"ERR {e}"}], "isError": True})
+        else:
+            if mid is not None: error(mid, -32601, f"method not found: {method}")
+
+if __name__ == "__main__":
+    try: main()
+    except (KeyboardInterrupt, BrokenPipeError): pass
