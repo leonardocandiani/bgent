@@ -4,14 +4,14 @@
     "name": "Leonardo Candiani"
   },
   "metadata": {
-    "description": "bgent — communication bus for background Claude Code sessions.",
-    "version": "1.0.0"
+    "description": "bgent — collision radar and communication bus for background Claude Code sessions.",
+    "version": "1.1.0"
   },
   "plugins": [
     {
       "name": "bgent",
-      "description": "Background Claude Code sessions message each other and stay aware of what the others are doing, delivered automatically via hooks. Discovery is native (claude agents --json), no fragile registration.",
-      "version": "1.0.0",
+      "description": "Background Claude Code sessions warn each other when they touch the same file (collision radar), message each other, and stay aware of what the others are doing, scoped per project, delivered automatically via hooks. Discovery is native (claude agents --json), no fragile registration.",
+      "version": "1.1.0",
       "author": {
         "name": "Leonardo Candiani"
       },

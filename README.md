@@ -1,8 +1,9 @@
 # bgent
 
-**A communication bus for background Claude Code sessions.** They message each other
-and stay aware of what the others are doing, delivered into their context automatically.
-Zero dependencies (Python stdlib only).
+**A collision radar and communication bus for background Claude Code sessions.** When two
+of your sessions touch the same file, each is warned before it steps on the other. They also
+message each other and stay aware of what the others are doing, scoped per project and
+delivered into their context automatically. Zero dependencies (Python stdlib only).
 
 ![bgent demo](docs/demo.gif)
 
@@ -31,24 +32,27 @@ into `settings.json` by hand. Update later from `/plugin` (or `claude plugin upd
 Requirements: the `claude` CLI on your `PATH`, and Python 3.8+ (stdlib only, nothing to
 `pip install`).
 
-## How it works
-
-Three layers:
+Four ideas:
 
 1. **Discovery, native.** bgent asks `claude agents --json` who exists. The Claude Code
    daemon is the source of truth, so there's no registration step that can drift or break.
 
-2. **Mailbox, durable.** A file-based bus under `~/.bgent`: one inbox (`jsonl`) per session
-   and a shared activity log. Writes are locked (`flock`) and read-marking re-reads the
-   inbox under the lock, so a message arriving concurrently is never lost.
+2. **Snapshots, off the hot path.** On `Stop`, a session reads the tail of its own transcript
+   and writes a small snapshot: its project, the files it touched, its current focus, where it
+   stopped. The expensive work happens here, once per turn (~21ms on an 11MB transcript), never
+   on the path that runs before every prompt.
 
-3. **Delivery, automatic.** Three hooks put messages and awareness into a session's context
-   without you asking:
-   - `SessionStart` — pulls accumulated messages when the session opens or resumes.
-   - `UserPromptSubmit` — delivers unread messages plus a snapshot of what the others are
-     doing, before each prompt.
-   - `Stop` — on turn end, delivers any new message and lets the session keep going to act
-     on it (a soft wake while it's active).
+3. **Collision radar, project-scoped.** Before each prompt, bgent cross-references the files
+   you touched against the other live sessions *in the same project* and warns you when they
+   overlap ("'X' is also working on app.ts, sync before editing"). Project is resolved from the
+   real repo root (`git rev-parse --show-toplevel`); a session with no resolvable project stays
+   a singleton, so one project's sessions never bleed into another's.
+
+4. **Delivery, automatic and quiet.** Hooks push only what's actionable, collisions and direct
+   messages, into your context. General awareness ("what is everyone doing") is pull, not push:
+   ask for it with `bgent_awareness` when you want it. Most turns inject nothing, and that's the
+   point. A durable file inbox under `~/.bgent` backs the messages (locked writes, lossless
+   read-marking).
 
 An **MCP server** exposes the bus as native tools so a session can act on it directly.
 
@@ -60,12 +64,12 @@ you want to act explicitly, the MCP tools are:
 - `bgent_ls` — list sessions and their status.
 - `bgent_send` — message a session (by name or id).
 - `bgent_broadcast` — message every other session.
-- `bgent_awareness` — what the others are doing right now.
+- `bgent_awareness` — each peer's goal and touched files, scoped to your project.
 - `bgent_inbox` — read this session's inbox.
 - `bgent_activity` — publish what this session is doing.
 
-You ask one session "is anyone else touching the database?" and it already knows, because
-the hook put the others' activity in its context.
+Collisions and direct messages arrive on their own; you only reach for these tools to send
+something or to pull a fuller picture with `bgent_awareness`.
 
 ## Delivery model: mailbox, not phone
 

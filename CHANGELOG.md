@@ -4,6 +4,38 @@ All notable changes to bgent are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-06-20
+
+Collision radar. bgent now warns a session when another live session in the same
+project is touching the same file, and everything it injects is project-scoped by
+construction and noise-bounded.
+
+### Added
+- Collision detection: before each prompt, bgent cross-references the files this session
+  touched against the other live sessions in the same project and pushes a warning
+  ("'X' is also working on app.ts, sync before editing") when they overlap.
+- Rich per-session snapshots, written on `Stop` from a 2MB tail-read of the transcript
+  (goal, files touched, where it stopped) instead of a flat 200-char summary. Measured
+  at ~21ms on an 11MB transcript; the read path never parses a transcript.
+- Project-scoped isolation: each snapshot records its project, resolved from the real
+  repo root (`git rev-parse --show-toplevel`). Sessions only ever see others in the SAME
+  resolved project; a session with no resolvable project (e.g. run from `$HOME`) stays a
+  singleton (`None` never matches `None`).
+- A single context selector with dedup and a hard char cap (`BGENT_MAX_CTX`, default
+  1500) over everything bgent injects, so it never floods a session's context.
+
+### Changed
+- Awareness is now pull, not push: the general "what is everyone doing" block is no
+  longer injected on every prompt (it was noise for solo sessions). Only collisions and
+  direct messages are pushed automatically; rich awareness is on demand via
+  `bgent_awareness` / `bgent awareness`, now reporting each peer's goal and touched files.
+- `bgent_activity` updates the session's snapshot instead of appending to a global log.
+
+### Fixed
+- Awareness was previously cross-referenced across ALL sessions regardless of project, so
+  sessions in different projects could see each other. It is now scoped to the resolved
+  project.
+
 ## [1.0.0] - 2026-06-19
 
 First stable release. bgent is now a Claude Code plugin (MCP server + hooks),

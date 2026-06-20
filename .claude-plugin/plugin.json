@@ -1,7 +1,7 @@
 {
   "name": "bgent",
-  "version": "1.0.0",
-  "description": "Communication bus for background Claude Code sessions: they message each other and stay aware of what the others are doing, delivered automatically via hooks. Zero dependencies (Python stdlib only).",
+  "version": "1.1.0",
+  "description": "Collision radar for background Claude Code sessions: warns when two sessions in the same project touch the same file, plus durable messaging and project-scoped awareness, delivered automatically via hooks. Zero dependencies (Python stdlib only).",
   "author": {
     "name": "Leonardo Candiani"
   },
@@ -13,6 +13,7 @@
     "multi-agent",
     "messaging",
     "coordination",
+    "collision-detection",
     "hooks"
   ]
 }

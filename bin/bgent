@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """bgent — a communication bus for background Claude Code sessions.
 
-Sessions message each other (durable inbox) and gain awareness of what the others are
-doing. Discovery is native: bgent asks `claude agents --json` who exists, so there is no
-registration step that can drift. Plan-only: never calls `claude -p`, no API billing.
-The store is file-based under ~/.bgent.
+Sessions message each other (durable inbox), detect when they touch the same file (collision
+radar), and can pull a rich snapshot of what the others are doing. Discovery is native:
+bgent asks `claude agents --json` who exists, so there is no registration step that can drift.
+Plan-only: never calls `claude -p`, no API billing. Store is file-based under ~/.bgent.
+
+Design invariant: PUBLISH is expensive and runs off the hot path (Stop hook parses the
+transcript tail and writes a snapshot); READ is cheap and runs before every prompt (only
+reads pre-digested snapshots, no transcript parse, no git). Project isolation is fail-closed:
+a session whose project cannot be resolved from a real repo root stays a singleton.
 """
 import sys, os, json, time, re, shutil, subprocess, argparse
 try:
@@ -21,12 +26,19 @@ def _which_claude():
 
 HOME = os.environ.get("BGENT_HOME", os.path.expanduser("~/.bgent"))
 INBOX = os.path.join(HOME, "inbox")
-ACTIVITY = os.path.join(HOME, "activity.jsonl")
+SNAPSHOTS = os.path.join(HOME, "snapshots")
 CLAUDE_BIN = os.environ.get("BGENT_CLAUDE_BIN") or _which_claude()
-RETAIN_READ_SECS = 7 * 24 * 3600  # prune messages already read more than 7 days ago
+RETAIN_READ_SECS = 7 * 24 * 3600          # prune messages already read more than 7 days ago
+MAX_CTX_CHARS = int(os.environ.get("BGENT_MAX_CTX", "1500"))  # hard cap on injected context
+MAX_TOUCHED_FILES = 15                     # cap touched-files per snapshot (a real session hit 242)
+TAIL_BYTES = 2 * 1024 * 1024              # only parse the last 2MB of a transcript (6ms vs 824ms)
+HOME_DIR = os.path.expanduser("~")
+PROJECT_ROOTS = [os.path.join(HOME_DIR, "projetos"), "/Volumes/Sandrinho"]
 
 def now(): return time.time()
-def ensure(): os.makedirs(INBOX, exist_ok=True)
+def ensure():
+    os.makedirs(INBOX, exist_ok=True)
+    os.makedirs(SNAPSHOTS, exist_ok=True)
 
 def append_locked(path, obj):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -34,6 +46,35 @@ def append_locked(path, obj):
         if HAVE_FCNTL: fcntl.flock(f, fcntl.LOCK_EX)
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
         if HAVE_FCNTL: fcntl.flock(f, fcntl.LOCK_UN)
+
+def _slug(s):
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "-", s or "").strip("-").lower() or None
+
+def projeto_de(cwd):
+    """Stable, safe project identity from a session's cwd, or None when it can't be resolved
+    with confidence. None NEVER matches None, so a session without a resolvable project stays
+    isolated (never grouped). Only call this on the PUBLISH side (git subprocess); the read
+    side reads the 'projeto' field already stored in the snapshot, never git."""
+    if not cwd or not os.path.isdir(cwd): return None
+    root = None
+    try:
+        r = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            root = r.stdout.strip()
+    except Exception:
+        root = None
+    if root and "/.claude/worktrees/" in root:       # worktree -> parent repo
+        root = root.split("/.claude/worktrees/")[0]
+    if not root:                                       # fall back to known project roots
+        for base in PROJECT_ROOTS:
+            b = base.rstrip("/")
+            if cwd.startswith(b + "/"):
+                seg = cwd[len(b) + 1:].split("/")
+                if seg and seg[0]:
+                    root = os.path.join(b, seg[0]); break
+    if not root: return None                           # HOME, Library, no-repo => singleton
+    return _slug(os.path.basename(root.rstrip("/")))
 
 def live_agents():
     """All live Claude Code sessions, keyed by full session id, straight from the daemon."""
@@ -45,8 +86,7 @@ def live_agents():
 
 def load_sessions():
     """Canonical session source = `claude agents --json` (the Claude Code daemon already
-    tracks every live session). No hook-based registration that can drift. Returns the
-    {id: rec} contract the rest of the CLI relies on."""
+    tracks every live session). No hook-based registration that can drift."""
     out = {}
     for sid, s in live_agents().items():
         out[sid] = {"id": sid, "name": s.get("name") or sid[:8], "cwd": s.get("cwd", ""),
@@ -128,38 +168,153 @@ def c_inbox(a):
         with open(path, "w") as f:
             for m in msgs: f.write(json.dumps(m, ensure_ascii=False) + "\n")
 
-def c_activity(a):
-    sessions = load_sessions(); t = resolve(a.id, sessions)
-    nm = a.name or (t.get("name") if t else a.id[:8])
-    append_locked(ACTIVITY, {"ts": now(), "id": (t["id"] if t else a.id), "name": nm, "summary": a.summary})
-    print("ok")
+# ---------- snapshots (publish-side: expensive, off the hot path) ----------
 
-def _awareness_lines(sid, sessions):
-    acts = {}
-    if os.path.exists(ACTIVITY):
-        for ln in open(ACTIVITY):
-            try:
-                r = json.loads(ln)
-                if r["id"] != sid: acts[r["id"]] = r
+def _read_tail(path, nbytes):
+    """Return up to the last nbytes of a file as text. Cheap: avoids parsing a huge transcript
+    (measured 6ms for a 2MB tail vs 824ms for a full scan of a real 137MB transcript)."""
+    try:
+        sz = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if sz > nbytes: f.seek(sz - nbytes)
+            return f.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+def build_snapshot(tpath, sid, rec):
+    """Tail-read the transcript and extract a pre-digested snapshot: current focus, files
+    touched, where it stopped. Runs on Stop, never on the read path."""
+    cwd = (rec.get("cwd") if rec else "") or ""
+    snap = {"id": sid, "name": (rec.get("name") if rec else None) or sid[:8],
+            "project": projeto_de(cwd), "cwd": cwd, "goal": "",
+            "files_touched": [], "stopped_at": "",
+            "status": (rec.get("status") if rec else "") or "", "updated_at": now()}
+    files, last_txt, goal = [], "", ""
+    for line in _read_tail(tpath, TAIL_BYTES).splitlines():
+        try: o = json.loads(line)
+        except Exception: continue
+        m = o.get("message")
+        if not isinstance(m, dict): continue
+        role, content = m.get("role"), m.get("content", "")
+        if role == "assistant" and isinstance(content, list):
+            for x in content:
+                if not isinstance(x, dict): continue
+                if x.get("type") == "text" and x.get("text", "").strip():
+                    last_txt = x["text"].strip()
+                elif x.get("type") == "tool_use" and x.get("name") in ("Edit", "Write", "MultiEdit"):
+                    fp = (x.get("input") or {}).get("file_path")
+                    if fp: files.append(fp)
+        elif role == "user":
+            txt = content if isinstance(content, str) else (
+                " ".join(x.get("text", "") for x in content if isinstance(x, dict) and x.get("type") == "text")
+                if isinstance(content, list) else "")
+            for ln in txt.splitlines():
+                ln = ln.strip()
+                if len(ln) > 40 and not ln.startswith("<"):
+                    goal = ln; break  # most recent qualifying user line wins (current focus)
+    seen, ded = set(), []
+    for fp in reversed(files):                 # keep most-recent, dedup
+        if fp not in seen: seen.add(fp); ded.append(fp)
+    snap["files_touched"] = list(reversed(ded))[-MAX_TOUCHED_FILES:]
+    snap["goal"] = goal
+    snap["stopped_at"] = last_txt.replace("\n", " ")[:200]
+    return snap
+
+def write_snapshot(snap):
+    ensure()
+    path = os.path.join(SNAPSHOTS, snap["id"] + ".json")
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f: json.dump(snap, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+def load_snapshots():
+    out = {}
+    if not os.path.isdir(SNAPSHOTS): return out
+    for fn in os.listdir(SNAPSHOTS):
+        if not fn.endswith(".json"): continue
+        try:
+            with open(os.path.join(SNAPSHOTS, fn)) as f: s = json.load(f)
+            out[s.get("id") or fn[:-5]] = s
+        except Exception: pass
+    return out
+
+def prune_dead_snapshots(live):
+    """Remove snapshots of sessions no longer alive. Guarded: if `live` is empty (agents
+    --json failed) do nothing, so a transient failure never wipes every snapshot."""
+    if not live or not os.path.isdir(SNAPSHOTS): return
+    for fn in os.listdir(SNAPSHOTS):
+        if fn.endswith(".json") and fn[:-5] not in live:
+            try: os.remove(os.path.join(SNAPSHOTS, fn))
             except Exception: pass
+
+def c_activity(a):
+    """Manually publish what this session is doing (updates its snapshot's 'parou_em' so the
+    others see it via awareness). Used by the bgent_activity MCP tool."""
+    sessions = load_sessions(); t = resolve(a.id, sessions)
+    sid = t["id"] if t else a.id
+    path = os.path.join(SNAPSHOTS, sid + ".json"); snap = {}
+    if os.path.exists(path):
+        try: snap = json.load(open(path))
+        except Exception: snap = {}
+    if not snap:
+        cwd = (t.get("cwd") if t else "") or ""
+        snap = {"id": sid, "name": a.name or (t.get("name") if t else None) or sid[:8],
+                "project": projeto_de(cwd), "cwd": cwd, "goal": "",
+                "files_touched": [], "stopped_at": "", "status": (t.get("status") if t else "")}
+    if a.name: snap["name"] = a.name
+    snap["stopped_at"] = a.summary[:200]; snap["updated_at"] = now()
+    write_snapshot(snap); print("ok")
+
+# ---------- awareness + collision (read-side: cheap, project-isolated) ----------
+
+def _awareness_lines(sid, sessions, snaps, my_project):
+    """Rich awareness of the OTHER live sessions in the SAME project. Project isolation is
+    fail-closed: my_project None => empty (a session with no resolvable project sees no one)."""
+    if my_project is None: return []
     lines = []
     for s2, r2 in sessions.items():
         if s2 == sid: continue
-        st = r2.get("status", "unknown")
-        last = acts.get(s2, {}).get("summary", "")
-        lines.append(f"  - {r2.get('name')} [{st}]" + (f": {last}" if last else ""))
+        snap = snaps.get(s2, {})
+        if snap.get("project") != my_project: continue       # None never matches None
+        nome = snap.get("name") or r2.get("name") or s2[:8]
+        line = f"  - {nome} [{r2.get('status', 'unknown')}]"
+        if snap.get("goal"): line += f": {snap['goal']}"
+        arqs = snap.get("files_touched", [])
+        if arqs: line += f" (files: {', '.join(os.path.basename(x) for x in arqs[:5])})"
+        lines.append(line)
     return lines
 
 def c_awareness(a):
     sessions = load_sessions()
     t = resolve(a.id, sessions); sid = t["id"] if t else a.id
-    lines = _awareness_lines(sid, sessions)
-    print("\n".join(lines) if lines else "(no other sessions)")
+    snaps = load_snapshots()
+    my_project = (snaps.get(sid) or {}).get("project")
+    if my_project is None and t:                              # pull is off the hot path: git ok
+        my_project = projeto_de(t.get("cwd", ""))
+    lines = _awareness_lines(sid, sessions, snaps, my_project)
+    print("\n".join(lines) if lines else "(no other sessions in this project)")
+
+def _collisions(me_sid, my_project, my_files, snaps, live):
+    """Files the current session touched that another LIVE same-project session also touched."""
+    if not my_project or not my_files: return []
+    myset = set(my_files); hits = []
+    for sid, s in snaps.items():
+        if sid == me_sid or sid not in live: continue
+        if s.get("project") != my_project: continue
+        for arq in (myset & set(s.get("files_touched", []))):
+            hits.append((s.get("name") or sid[:8], arq))
+    return hits
+
+def _cap(text):
+    if len(text) <= MAX_CTX_CHARS: return text
+    return text[:MAX_CTX_CHARS].rstrip() + "\n... (truncated by bgent cap)"
 
 def _deliver_ctx(sid):
-    """Build the context to inject (unread inbox + awareness). Returns (ctx, allm, path, unread)."""
+    """Build the context to push (collision + unread inbox). General awareness is NOT pushed
+    here anymore (pull it via `bgent awareness`). Returns (ctx, allm, path, unread)."""
     sessions = load_sessions()
     t = resolve(sid, sessions); rid = t["id"] if t else sid
+    snaps = load_snapshots(); prune_dead_snapshots(sessions)
     path = os.path.join(INBOX, rid + ".jsonl"); allm = []; unread = []
     if os.path.exists(path):
         for ln in open(path):
@@ -168,18 +323,21 @@ def _deliver_ctx(sid):
                 if not m.get("read"): unread.append(m)
             except Exception: pass
     parts = []
+    me = snaps.get(rid, {})
+    seen = set()
+    for nome, arq in _collisions(rid, me.get("project"), me.get("files_touched", []), snaps, sessions):
+        k = (nome, os.path.basename(arq))
+        if k in seen: continue
+        seen.add(k)
+        parts.append(f"COLLISION (bgent): '{nome}' is also working on {os.path.basename(arq)} in the same project, sync before editing.")
     if unread:
         parts.append("Messages from other sessions (bgent):")
         for m in unread: parts.append(f"  - {m['from']}: {m['body']}")
-    aw = _awareness_lines(rid, sessions)
-    if aw:
-        parts.append("What the other sessions are doing now (bgent awareness):"); parts.extend(aw)
-    return "\n".join(parts), allm, path, unread
+    return (_cap("\n".join(parts)) if parts else ""), allm, path, unread
 
 def _mark_read(allm, unread, path):
     """Mark ONLY the delivered messages (by id) as read, under a lock and RE-READING the
-    file: if a new message arrived between the read and now, it is not overwritten (this
-    fixes the race of the old lockless rewrite). Also prunes messages read long ago."""
+    file: a message arriving between the read and now is not overwritten. Prunes old read msgs."""
     if not unread or not os.path.exists(path): return
     read_ids = {m.get("id") for m in unread}
     cutoff = now() - RETAIN_READ_SECS
@@ -190,28 +348,11 @@ def _mark_read(allm, unread, path):
             try: m = json.loads(ln)
             except Exception: continue
             if m.get("id") in read_ids: m["read"] = True
-            if m.get("read") and m.get("ts", cutoff + 1) < cutoff: continue  # prune read + old
+            if m.get("read") and m.get("ts", cutoff + 1) < cutoff: continue
             kept.append(m)
         f.seek(0); f.truncate()
         for m in kept: f.write(json.dumps(m, ensure_ascii=False) + "\n")
         if HAVE_FCNTL: fcntl.flock(f, fcntl.LOCK_UN)
-
-def last_assistant_text(tpath):
-    """Last assistant text turn in a transcript jsonl (used for automatic activity)."""
-    if not tpath or not os.path.exists(tpath): return ""
-    last = ""
-    try:
-        for line in open(tpath):
-            try: o = json.loads(line)
-            except Exception: continue
-            m = o.get("message", {})
-            if isinstance(m, dict) and m.get("role") == "assistant":
-                c = m.get("content", "")
-                if isinstance(c, list):
-                    c = " ".join(x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text")
-                if isinstance(c, str) and c.strip(): last = c.strip()
-    except Exception: pass
-    return last.replace("\n", " ")[:200]
 
 def read_hook_input():
     try:
@@ -221,7 +362,7 @@ def read_hook_input():
         return {}
 
 def c_hook(a):
-    """Dispatcher for the Claude Code hooks. Reads the flat payload from stdin.
+    """Dispatcher for the Claude Code hooks (flat payload on stdin).
     Events: session-start | user-prompt | stop."""
     data = read_hook_input()
     sid = data.get("session_id") or data.get("sessionId") or ""
@@ -229,25 +370,19 @@ def c_hook(a):
     if not sid: return
     ensure()
     ev = a.event
-    if ev == "session-start":
-        # pull accumulated messages + awareness when the session opens or resumes
+    if ev in ("session-start", "user-prompt"):
         ctx, allm, path, unread = _deliver_ctx(sid)
         _mark_read(allm, unread, path)
         if ctx:
-            print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
-    elif ev == "user-prompt":
-        ctx, allm, path, unread = _deliver_ctx(sid)
-        _mark_read(allm, unread, path)
-        if ctx:
-            print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ctx}}))
+            name = "SessionStart" if ev == "session-start" else "UserPromptSubmit"
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": name, "additionalContext": ctx}}))
     elif ev == "stop":
-        summary = last_assistant_text(tpath)
-        if summary:
-            t = resolve(sid, load_sessions())
-            nm = t.get("name") if t else sid[:8]
-            append_locked(ACTIVITY, {"ts": now(), "id": (t["id"] if t else sid), "name": nm, "summary": summary})
-        # deliver messages on turn end; ONLY continue the turn if there is an unread message.
-        # awareness alone never holds the turn (otherwise the session would never stop = loop).
+        # publish-side: parse transcript tail once, write the rich snapshot (off the read path)
+        rec = resolve(sid, load_sessions()) or {"id": sid, "name": sid[:8], "cwd": data.get("cwd", ""), "status": ""}
+        try: write_snapshot(build_snapshot(tpath, rec.get("id", sid), rec))
+        except Exception: pass
+        # deliver pending push; ONLY continue the turn on a real unread message (never on
+        # collision/awareness alone, otherwise the session would never stop = loop).
         ctx, allm, path, unread = _deliver_ctx(sid)
         if unread:
             _mark_read(allm, unread, path)
